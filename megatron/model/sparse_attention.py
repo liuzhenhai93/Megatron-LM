@@ -8,7 +8,7 @@ from megatron.core import mpu
 class XformerSparseAttention(MegatronModule):
 
     def __init__(self, block_size=16, dropout=0.5, causal = True, seq_len=None, num_heads=None):
-         args = get_args()
+        args = get_args()
         if not seq_len:
             seq_len = args.seq_length
 
