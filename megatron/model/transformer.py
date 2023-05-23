@@ -28,6 +28,11 @@ try:
 except ImportError:
     flash_attn_unpadded_func = None
 
+try: 
+    from megatron.model.sparse_attention import XformerSparseAttention as SparseAttention
+except ImportError:
+    SparseAttention = None    
+
 """ We use the following notation throughout this file:
      h: hidden size
      n: number of attention heads
@@ -417,6 +422,7 @@ class ParallelAttention(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         self.use_flash_attn = args.use_flash_attn
+        self.use_sparse_attn = args.use_sparse_attn and SparseAttention
         if self.use_flash_attn:
             if flash_attn_unpadded_func is None:
                 raise ImportError('FlashAttention is not installed, please install with '
@@ -476,6 +482,8 @@ class ParallelAttention(MegatronModule):
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=args.attention_dropout
             )
+        if self.use_sparse_attn
+            self.core_attention_sparse = SparseAttention()
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -647,14 +655,12 @@ class ParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        if not self.use_flash_attn:
-            if self.checkpoint_core_attention:
-                context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask)
-            else:
-                context_layer = self.core_attention(
-                    query_layer, key_layer, value_layer, attention_mask)
-        else:
+        if self.use_sparse_attn:
+            q, k, v = [rearrange(x, 's b h d -> b h s d').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            context_layer = self.core_attention_sparse(q, k, v)        
+            context_layer = rearrange(context_layer, 'b h s d -> s b (h d)').contiguous()           
+        elif self.use_flash_attn:
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
             if not self.sequence_parallel:
@@ -663,6 +669,15 @@ class ParallelAttention(MegatronModule):
             else:
                 context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+        else:
+            if self.checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer, key_layer, value_layer, attention_mask)
+            else:
+                context_layer = self.core_attention(
+                    query_layer, key_layer, value_layer, attention_mask)
+
+
 
         # =================
         # Output. [sq, b, h]
