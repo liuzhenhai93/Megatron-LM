@@ -9,10 +9,13 @@ from megatron.core import mpu
 
 class XformerSparseAttention(MegatronModule):
 
-    def __init__(self, block_size=16, dropout=0.5, causal = True, seq_len=None, num_heads=None):
+    def __init__(self, dropout=0.5, causal=True, block_size=None, seq_len=None, num_heads=None):
         super(XformerSparseAttention, self).__init__()
-        if not seq_len or not num_heads:
+        if (not block_size) or (not seq_len) or (not num_heads):
             args = get_args()
+
+        if not block_size:
+            block_size = args.sparse_attn_block_size    
 
         if not seq_len:
             seq_len = args.seq_length

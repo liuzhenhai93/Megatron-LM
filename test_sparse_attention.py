@@ -10,7 +10,7 @@ if __name__ == "__main__":
     EMB = 12288 // TP
     BLOCK_SIZE = 16
     DROPOUT = 0.0
-    attention = SparseAttention(seq_len = 32768, num_heads = HEADS)
+    attention = SparseAttention(block_size=BLOCK_SIZE, seq_len = 32768, num_heads = HEADS)
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
     dtype=torch.bfloat16
     q = torch.randn(*shape, dtype=dtype).cuda()

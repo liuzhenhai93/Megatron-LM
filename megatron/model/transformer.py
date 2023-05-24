@@ -486,7 +486,7 @@ class ParallelAttention(MegatronModule):
                 causal=True, attention_dropout=args.attention_dropout
             )
         if self.use_sparse_attn:
-            self.core_attention_sparse = SparseAttention()
+            self.core_attention_sparse = SparseAttention(dropout=args.attention_dropout)
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(

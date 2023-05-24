@@ -31,8 +31,8 @@ GPT_ARGS="--num-layers 10 \
           --num-attention-heads 64 \
           --seq-length 32768 \
           --max-position-embeddings 32768 \
-          --micro-batch-size 1 \
           --global-batch-size 8 \
+          --micro-batch-size 1 \
           --lr 0.00005 \
           --min-lr 0.00001 \
           --lr-decay-iters 360000 \
@@ -49,6 +49,10 @@ GPT_ARGS="--num-layers 10 \
           --bf16 
           "
           #--bf16 \
+          #--ps 8 \
+          #--use-sparse-attn \
+          #--use-flash-attn \
+          #--sparse-attn-block-size 32\
 
 OUTPUT_ARGS="--log-interval 1 \
              --save-interval 10000000 \
