@@ -422,8 +422,11 @@ class ParallelAttention(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         self.use_flash_attn = args.use_flash_attn
-        self.use_sparse_attn = args.use_sparse_attn and SparseAttention
-        if self.use_flash_attn:
+        self.use_sparse_attn = args.use_sparse_attn 
+        if self.use_sparse_attn:
+            if SparseAttention is None:
+                raise ImportError("xformer sparse attention is not imported")
+        elif self.use_flash_attn:
             if flash_attn_unpadded_func is None:
                 raise ImportError('FlashAttention is not installed, please install with '
                                   'pip install flash-attn')
@@ -482,7 +485,7 @@ class ParallelAttention(MegatronModule):
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=args.attention_dropout
             )
-        if self.use_sparse_attn
+        if self.use_sparse_attn:
             self.core_attention_sparse = SparseAttention()
 
         # Output.
