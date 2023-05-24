@@ -43,9 +43,9 @@ GPT_ARGS="--num-layers 10 \
           --no-bias-gelu-fusion \
           --no-bias-dropout-fusion \
           --train-iters 300 \
-          --use-memory-attn \
           --recompute-granularity full \
           --recompute-method uniform \
+          --use-sparse-attn \
           --bf16 
           "
           #--bf16 \
@@ -55,7 +55,7 @@ OUTPUT_ARGS="--log-interval 1 \
              --eval-interval 100000 \
              --eval-iters 1"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun $DISTRIBUTED_ARGS \
        ./pretrain_gpt.py \
        --tensor-model-parallel-size 8 \
        --pipeline-model-parallel-size 1 \
