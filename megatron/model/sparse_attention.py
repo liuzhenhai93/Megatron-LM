@@ -24,9 +24,11 @@ class XformerSparseAttention(MegatronModule):
             world_size = mpu.get_tensor_model_parallel_world_size()
             num_heads = core.utils.divide(args.num_attention_heads, world_size)
 
-        config = FixedSparsityConfig(num_heads, block_size=block_size)
+        config = FixedSparsityConfig(num_heads, attention="unidirectional",block_size=block_size)
         layout = config.make_layout(seq_len)
         layout = torch.tril(layout).to(torch.int32).cuda() 
+        #print(layout)
+        #print(torch.nonzero(layout).shape[0]*block_size*block_size)
         self._att = BlockSparseAttention(layout=layout, 
         block_size=block_size, 
         dropout=dropout, 
