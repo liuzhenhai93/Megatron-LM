@@ -12,8 +12,8 @@ import math
 BATCH = 1
 TP = 8
 HEADS = 8 // TP
-SEQ = 1024
-EMB = 8192 // TP
+SEQ = 16*4
+EMB = 1024*TP // TP
 DROPOUT = 0.1
 
 def create_mask_for_sparse_attention(block_size, seq_len = SEQ):
@@ -99,7 +99,7 @@ class HandWriteXformerSparse():
 
         def dense_dot_sdd(q, k):
             s = torch.matmul(q, k.permute(*[0, 1, 3, 2]))
-            s = s.masked_fill(torch.tril(mask) == 0, 0.0)
+            s = s.masked_fill(mask == 0, 0.0)
             return s
  
 
@@ -172,7 +172,7 @@ class HandWriteXformerSparse():
         return a   
 
     def stage1(self, q, k):
-        qt = q #/ math.sqrt(float(q.size(-1)))
+        qt = q / math.sqrt(float(q.size(-1)))
         s1 = self.sparse_dot_sdd(qt, k)
         s2 = self.dense_dot_sdd(qt, k)
         return s1, s2
@@ -278,19 +278,21 @@ def test_stages_precision(block_size):
 
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
     dtype=torch.float32
+    
+    q = torch.rand(*shape, dtype=dtype).cuda() 
+    k = torch.rand(*shape, dtype=dtype).cuda() 
+    v = torch.rand(*shape, dtype=dtype).cuda() 
     """
-    q = torch.randn(*shape, dtype=dtype).cuda()
-    k = torch.randn(*shape, dtype=dtype).cuda()
-    v = torch.randn(*shape, dtype=dtype).cuda()
-    """
-    low = 0
-    high = 5
-    q = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()
-    k = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()
-    v = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()
-    v = torch.ones(size=shape).to(dtype).cuda()*4
+    low = -10
+    high = 10
+    q = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
+    k = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
+    v = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
+    #v = torch.ones(size=shape).to(dtype).cuda()*4
     #v = torch.randn(*shape, dtype=dtype).cuda()
-    """
+    q = torch.ones(size=shape).to(dtype).cuda()*5
+    k = torch.ones(size=shape).to(dtype).cuda()*5
+    v = torch.ones(size=shape).to(dtype).cuda()*5
     q = torch.ones(size=shape).to(dtype).cuda()*5
     k = torch.ones(size=shape).to(dtype).cuda()*5
     v = torch.ones(size=shape).to(dtype).cuda()*5
@@ -323,13 +325,21 @@ def test_stages_precision(block_size):
     report_diff(f"block_size{block_size}-stod-stodv2", stage1_1d, stage1_1d2)
       
     stage2_1, stage2_2 = attention.stage2(stage1_1, stage1_1d)
+    torch.cuda.synchronize()
     stage2_1d = attention.stodv2(stage2_1)
+    torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-soft", stage2_1d, stage2_2)
    
 
     stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d, v)
+    torch.cuda.synchronize()
     
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
+
+    stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d2, v)
+    torch.cuda.synchronize()
+    
+    report_diff(f"block_size{block_size}-att_d2", stage3_1, stage3_2)
     
     
 if __name__ == "__main__":
