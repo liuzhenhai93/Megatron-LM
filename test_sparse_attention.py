@@ -12,8 +12,8 @@ import math
 BATCH = 1
 TP = 8
 HEADS = 8 // TP
-SEQ = 16*4
-EMB = 1024*TP // TP
+SEQ = 1024
+EMB = 512*TP // TP
 DROPOUT = 0.1
 
 def create_mask_for_sparse_attention(block_size, seq_len = SEQ):
@@ -172,7 +172,7 @@ class HandWriteXformerSparse():
         return a   
 
     def stage1(self, q, k):
-        qt = q / math.sqrt(float(q.size(-1)))
+        qt = q #/ math.sqrt(float(q.size(-1)))
         s1 = self.sparse_dot_sdd(qt, k)
         s2 = self.dense_dot_sdd(qt, k)
         return s1, s2
@@ -182,15 +182,22 @@ class HandWriteXformerSparse():
         #do = do.masked_fill(self.mask == 0, 0.0)
         return do
 
-    def stodv2(self, so):
+    def stodv2(self, so, row_major=True):
         data = torch.zeros([1, self.layout.size(0),self.seq_len, self.seq_len]).cuda()
         t = 0
         for i in range(self.layout.size(0)):
-            for j in range(self.layout.size(1)):
+            if row_major:
+                for j in range(self.layout.size(1)):
+                    for k in range(self.layout.size(2)):
+                        if(self.layout[i][j][k] == 1):
+                            data[0][i][j*self.block_size:(j+1)*self.block_size, k*self.block_size:(k+1)*self.block_size] = so[0][t][:,:]
+                            t = t + 1
+            else:
                 for k in range(self.layout.size(2)):
-                    if(self.layout[i][j][k] == 1):
-                        data[0][i][j*self.block_size:(j+1)*self.block_size, k*self.block_size:(k+1)*self.block_size] = so[0][t][:,:]
-                        t = t + 1
+                    for j in range(self.layout.size(1)):
+                        if(self.layout[i][j][k] == 1):
+                            data[0][i][j*self.block_size:(j+1)*self.block_size, k*self.block_size:(k+1)*self.block_size] = so[0][t][:,:]
+                            t = t + 1         
         return data                
 
 
@@ -272,45 +279,53 @@ def report_diff(context, a,  b):
 
 
 def test_stages_precision(block_size):
+    seed = 2
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # When running on the CuDNN backend, two further options must be set
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     attention = HandWriteXformerSparse(block_size, HEADS, SEQ)
     print(f"{attention.block_num*16*16}")
 
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
     dtype=torch.float32
-    
+    """
     q = torch.rand(*shape, dtype=dtype).cuda() 
     k = torch.rand(*shape, dtype=dtype).cuda() 
     v = torch.rand(*shape, dtype=dtype).cuda() 
     """
-    low = -10
-    high = 10
-    q = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
-    k = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
-    v = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*0.1
+    low = 0
+    high = 2
+    q = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*5
+    k = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*5
+    #v = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()
+    v=torch.diag(torch.ones([SEQ])).unsqueeze(0).unsqueeze(0).expand(BATCH, HEADS, -1, -1).to(torch.float32).cuda()
+    #print(v)
+    """
     #v = torch.ones(size=shape).to(dtype).cuda()*4
     #v = torch.randn(*shape, dtype=dtype).cuda()
     q = torch.ones(size=shape).to(dtype).cuda()*5
     k = torch.ones(size=shape).to(dtype).cuda()*5
     v = torch.ones(size=shape).to(dtype).cuda()*5
-    q = torch.ones(size=shape).to(dtype).cuda()*5
-    k = torch.ones(size=shape).to(dtype).cuda()*5
-    v = torch.ones(size=shape).to(dtype).cuda()*5
     """
     torch.cuda.synchronize()
     
-    k.requires_grad_(True)
-    q.requires_grad_(True)
-    v.requires_grad_(True)
+    #k.requires_grad_(True)
+    #q.requires_grad_(True)
+    #v.requires_grad_(True)
     a = attention.forward1(q, k, v)
     b = attention.forward2(q, k, v)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-attention", a, b)
     stage1_1, stage1_2 = attention.stage1(q, k)
+    #print(stage1_1)
     stage1_1d = attention.stodv2(stage1_1)
     stage1_1d2 = attention.stod(stage1_1)
+    stage1_1d3 = attention.stodv2(stage1_1, False)
 
-    print(f"shape {stage1_1.shape}")
+    #print(f"shape {stage1_1.shape}")
     
     print(f"sparse numl {torch.numel(stage1_1)}")
     for i in range(8):
@@ -323,23 +338,37 @@ def test_stages_precision(block_size):
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-qk", stage1_1d, stage1_2)
     report_diff(f"block_size{block_size}-stod-stodv2", stage1_1d, stage1_1d2)
+    #report_diff(f"block_size{block_size}-stod-stodv3", stage1_1d2, stage1_1d3)
       
     stage2_1, stage2_2 = attention.stage2(stage1_1, stage1_1d)
     torch.cuda.synchronize()
     stage2_1d = attention.stodv2(stage2_1)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-soft", stage2_1d, stage2_2)
-   
-
+    v[0][0][1:SEQ,1:SEQ] = 0
+    #print(v)
+    
+    stage1_1[0][0][1:,:]= 0
+    stage1_1[0][0][:,1:]= 0
+    stage1_1[0][0][1:,:]= 0
+    stage1_1[0][1:,:,:]= 0
+    #print(stage1_1)
+    stage1_1d[0][0][1:,:]= 0
+    stage1_1d[0][0][:,1:]= 0
+    torch.cuda.synchronize()
     stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d, v)
     torch.cuda.synchronize()
     
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
+    #print(stage3_1)
+    #print(stage3_2)
+    #print(attention.sparse_dot_dsd.c_lut)
+    print(attention.sparse_dot_dsd.c_width)
 
-    stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d2, v)
+    stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_2, v)
     torch.cuda.synchronize()
     
-    report_diff(f"block_size{block_size}-att_d2", stage3_1, stage3_2)
+    #report_diff(f"block_size{block_size}-att_d2", stage3_1, stage3_2)
     
     
 if __name__ == "__main__":
@@ -349,6 +378,6 @@ if __name__ == "__main__":
         #test_precision(block_size)
         #test_stages_precision(block_size)
         pass
-    test_stages_precision(16)    
+    test_stages_precision(32)    
     #print(create_mask_for_sparse_attention(2, 16))
     
