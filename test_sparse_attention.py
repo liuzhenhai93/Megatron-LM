@@ -6,7 +6,10 @@ from megatron.model.sparse_attention import XformerSparseAttention as SparseAtte
 from xformers.components.attention.sparsity_config import FixedSparsityConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
+from triton.ops import matmul as dense_matmul
 import math
+import contextlib
+import sys
 
 
 BATCH = 1
@@ -114,10 +117,13 @@ class HandWriteXformerSparse():
         self.dense_dot_dsd = dense_dot_dsd
         self.dense_softmax = dense_softmax
 
-    def forward1(self, q, k, v):
+    def try_create_kernel(self, device):
         if not hasattr(self, "sparse_dot_sdd"):
-                self.create_triton_kernels(q.device)
+                self.create_triton_kernels(device)
 
+
+    def forward1(self, q, k, v):
+        self.try_create_kernel(q.device)
         assert (
                 q.shape[-2] == k.shape[-2]
         ), "Blocksparse requires the same dimensions for K and Q for now"
@@ -144,9 +150,7 @@ class HandWriteXformerSparse():
 
 
     def forward2(self, q, k, v):
-        if not hasattr(self, "sparse_dot_sdd"):
-            self.create_triton_kernels(q.device)
-
+        self.try_create_kernel(q.device)
         assert (
                 q.shape[-2] == k.shape[-2]
         ), "Blocksparse requires the same dimensions for K and Q for now"
@@ -172,17 +176,20 @@ class HandWriteXformerSparse():
         return a   
 
     def stage1(self, q, k):
+        self.try_create_kernel(q.device)
         qt = q #/ math.sqrt(float(q.size(-1)))
         s1 = self.sparse_dot_sdd(qt, k)
         s2 = self.dense_dot_sdd(qt, k)
         return s1, s2
 
     def stod(self, so):
+        self.try_create_kernel(so.device)
         do = self.sparse_dot_dsd(so, torch.diag(torch.ones([self.seq_len])).unsqueeze(0).unsqueeze(0).expand(BATCH, HEADS, -1, -1).to(torch.float32).cuda())
         #do = do.masked_fill(self.mask == 0, 0.0)
         return do
 
     def stodv2(self, so, row_major=True):
+        self.try_create_kernel(so.device)
         data = torch.zeros([1, self.layout.size(0),self.seq_len, self.seq_len]).cuda()
         t = 0
         for i in range(self.layout.size(0)):
@@ -204,12 +211,15 @@ class HandWriteXformerSparse():
 
 
     def stage2(self, o1, o2):
+        self.try_create_kernel(o1.device)
         return self.sparse_softmax(o1, scale=1.0, is_causal=self.causal), self.dense_softmax(o2)
 
     def stage3(self, p1, p2, v):
+        self.try_create_kernel(p1.device)
         return self.sparse_dot_dsd(p1, v), self.dense_dot_dsd(p2, v)
       
-
+def triton_dense_matmul(a, b):
+    return dense_matmul(a, b)
 
 def torch_sparse_attention_simulate(block_size, seq_len = SEQ, num_heads = HEADS):
     # (b, seq, head, hidden) -> (b, seq, head, hidden)
@@ -315,19 +325,22 @@ def test_stages_precision(block_size):
     #k.requires_grad_(True)
     #q.requires_grad_(True)
     #v.requires_grad_(True)
+    """
     a = attention.forward1(q, k, v)
     b = attention.forward2(q, k, v)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-attention", a, b)
+    """
+
     stage1_1, stage1_2 = attention.stage1(q, k)
     #print(stage1_1)
     stage1_1d = attention.stodv2(stage1_1)
-    stage1_1d2 = attention.stod(stage1_1)
+    #stage1_1d2 = attention.stod(stage1_1)
     stage1_1d3 = attention.stodv2(stage1_1, False)
 
     #print(f"shape {stage1_1.shape}")
     
-    print(f"sparse numl {torch.numel(stage1_1)}")
+    #print(f"sparse numl {torch.numel(stage1_1)}")
     for i in range(8):
         for j in range(8):
             pass
@@ -336,15 +349,18 @@ def test_stages_precision(block_size):
 
 
     torch.cuda.synchronize()
-    report_diff(f"block_size{block_size}-qk", stage1_1d, stage1_2)
-    report_diff(f"block_size{block_size}-stod-stodv2", stage1_1d, stage1_1d2)
+    #report_diff(f"block_size{block_size}-qk", stage1_1d, stage1_2)
+    #report_diff(f"block_size{block_size}-stod-stodv2", stage1_1d, stage1_1d2)
     #report_diff(f"block_size{block_size}-stod-stodv3", stage1_1d2, stage1_1d3)
-      
+
+    """
     stage2_1, stage2_2 = attention.stage2(stage1_1, stage1_1d)
     torch.cuda.synchronize()
     stage2_1d = attention.stodv2(stage2_1)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-soft", stage2_1d, stage2_2)
+    """
+
     v[0][0][1:SEQ,1:SEQ] = 0
     #print(v)
     
@@ -358,8 +374,10 @@ def test_stages_precision(block_size):
     torch.cuda.synchronize()
     stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d, v)
     torch.cuda.synchronize()
-    
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
+    trr = triton_dense_matmul(stage1_1d.reshape([SEQ, SEQ]), v.reshape([SEQ, SEQ]))
+    print(trr[0][0])
+
     #print(stage3_1)
     #print(stage3_2)
     #print(attention.sparse_dot_dsd.c_lut)
@@ -369,7 +387,7 @@ def test_stages_precision(block_size):
     torch.cuda.synchronize()
     
     #report_diff(f"block_size{block_size}-att_d2", stage3_1, stage3_2)
-    
+
     
 if __name__ == "__main__":
     
