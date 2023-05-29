@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 from megatron.model.sparse_attention import XformerSparseAttention as SparseAttention
+from megatron.model.sparse_attention import create_layout
 from xformers.components.attention.sparsity_config import FixedSparsityConfig
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
@@ -11,37 +12,66 @@ import math
 import contextlib
 import sys
 
+import time
+from xformers.components.attention import BlockSparseAttention
+from xformers.components.attention.sparsity_config import FixedSparsityConfig
+
 
 BATCH = 1
 TP = 8
 HEADS = 8 // TP
-SEQ = 1024*4
-EMB = 512*TP // TP
+SEQ = 1024*32
+EMB = 8192 // TP
 DROPOUT = 0.1
 
-def create_mask_for_sparse_attention(block_size, seq_len = SEQ):
-    config = FixedSparsityConfig(1, attention="unidirectional", block_size=block_size)
-    layout = config.make_layout(seq_len)
-    #print(layout)
+
+def create_mask_for_sparse_attention(block_size, seq_len = SEQ, sparse_type="fix"):
+    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True)
     mask =  torch.zeros((1, seq_len, seq_len), dtype=torch.uint8, device = torch.device('cuda:0'))
     for i in range (layout.shape[1]):
         for j in range (layout.shape[2]):
             mask[0][i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size] = layout[0][i][j]  
     return mask      
-    #return torch.ones((1, seq_len, seq_len), dtype=torch.uint8, device = torch.device('cuda:0')) #torch.tril(mask)    
 
+def create_sparse_attention(sparse_type, block_size, seq_len, num_heads=1, dropout=0, causal=True):
+    layout = create_layout(sparse_type=sparse_type,num_heads=num_heads, seq_len=seq_len, 
+    block_size=block_size, causal=True)
+    return BlockSparseAttention(layout=layout, block_size=block_size, 
+    dropout=dropout, num_heads=num_heads, causal=causal)
+                                
+
+def test_sparse_attention_performance(block_size, dtype, sparse_type="fix"):
+    attention = create_sparse_attention(sparse_type,block_size=block_size, seq_len=SEQ)
+    shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
+    q = torch.randn(*shape, dtype=dtype).cuda() 
+    k = torch.randn(*shape, dtype=dtype).cuda() 
+    v = torch.randn(*shape, dtype=dtype).cuda() 
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    out_grad = torch.ones(*shape).to(dtype).to("cuda:0")
+    t = attention(q, k, v)
+    t.backward(out_grad)
+    torch.cuda.synchronize()
+    begin = time.time()
+    t2 = attention(q, k, v)
+    torch.cuda.synchronize()
+    end = time.time()
+    forward_time = end - begin
+    t2.backward(out_grad)
+    backward_time = time.time() - end
+    torch.cuda.synchronize()
+    print(f"{sparse_type} block_size {block_size} dtype {dtype} : forward {forward_time} backward {backward_time}")
+    
 
 
 
 class HandWriteXformerSparse():
     
-    def __init__(self,block_size, num_heads, seq_len, causal: bool = True, dropout: float = 0.0):
+    def __init__(self,block_size, num_heads, seq_len, sparse_type="fix", causal: bool = True, dropout: float = 0.0):
 
-        config = FixedSparsityConfig(num_heads, attention="unidirectional", block_size=block_size)
-        layout = config.make_layout(seq_len)
-        layout = torch.tril(layout).to(torch.int32).cuda()    
-
-        #layout = torch.ones([seq_len // block_size, seq_len // block_size]).to(torch.int32).cuda() 
+        layout = create_layout(sparse_type=sparse_type,num_heads=num_heads, 
+        seq_len=seq_len, block_size=block_size, causal=causal)
 
         assert block_size in (
                 16,
@@ -65,6 +95,9 @@ class HandWriteXformerSparse():
         self.causal = causal
         self.seq_len = seq_len
         self.block_num = torch.sum(self.layout)
+
+        mask = create_mask_for_sparse_attention(self.block_size, self.seq_len, sparse_type=sparse_type)
+        self.mask = mask
         
 
     def create_triton_kernels(self, device):
@@ -97,12 +130,9 @@ class HandWriteXformerSparse():
             device=device,
         )
 
-        mask = create_mask_for_sparse_attention(self.block_size, self.seq_len)
-        self.mask = mask
-
         def dense_dot_sdd(q, k):
             s = torch.matmul(q, k.permute(*[0, 1, 3, 2]))
-            s = s.masked_fill(mask == 0, 0.0)
+            s = s.masked_fill(self.mask == 0, 0.0)
             return s
  
 
@@ -110,7 +140,7 @@ class HandWriteXformerSparse():
             return torch.matmul(p, v)
 
         def dense_softmax(s):
-            s = s.masked_fill(torch.tril(mask) == 0, float('-inf'))
+            s = s.masked_fill(torch.tril(self.mask) == 0, float('-inf'))
             return F.softmax(s, dim=3)
 
         self.dense_dot_sdd = dense_dot_sdd
@@ -188,28 +218,6 @@ class HandWriteXformerSparse():
         #do = do.masked_fill(self.mask == 0, 0.0)
         return do
 
-    def stodv2(self, so, row_major=True):
-        self.try_create_kernel(so.device)
-        data = torch.zeros([1, self.layout.size(0),self.seq_len, self.seq_len]).cuda()
-        t = 0
-        for i in range(self.layout.size(0)):
-            if row_major:
-                for j in range(self.layout.size(1)):
-                    for k in range(self.layout.size(2)):
-                        if(self.layout[i][j][k] == 1):
-                            data[0][i][j*self.block_size:(j+1)*self.block_size, k*self.block_size:(k+1)*self.block_size] = so[0][t][:,:]
-                            t = t + 1
-            else:
-                for k in range(self.layout.size(2)):
-                    for j in range(self.layout.size(1)):
-                        if(self.layout[i][j][k] == 1):
-                            data[0][i][j*self.block_size:(j+1)*self.block_size, k*self.block_size:(k+1)*self.block_size] = so[0][t][:,:]
-                            t = t + 1         
-        return data                
-
-
-
-
     def stage2(self, o1, o2):
         self.try_create_kernel(o1.device)
         return self.sparse_softmax(o1, scale=1.0, is_causal=self.causal), self.dense_softmax(o2)
@@ -217,43 +225,19 @@ class HandWriteXformerSparse():
     def stage3(self, p1, p2, v):
         self.try_create_kernel(p1.device)
         return self.sparse_dot_dsd(p1, v), self.dense_dot_dsd(p2, v)
-      
-def triton_dense_matmul(a, b):
-    return dense_matmul(a, b)
 
-def torch_sparse_attention_simulate(block_size, seq_len = SEQ, num_heads = HEADS):
-    # (b, seq, head, hidden) -> (b, seq, head, hidden)
-    def attension(q, k, v):
-        # (b, seq, head, hidden) -> (b, head, seq, hidden)
-        qt = q.permute(*[0, 2, 1, 3])
-        kt = k.permute(*[0, 2, 1, 3])
-        vt = v.permute(*[0, 2, 1, 3])
-        # scale
-        scale = 1.0 / np.sqrt(q.shape[-1])
-        # q * k^t, (b, head, seq, hidden), (b, head, hidden, seq)-> (b, head, seq, seq)
-        s = torch.matmul(qt, kt.permute(*[0, 1, 3, 2]))
-        s = s * scale
-        mask = create_mask_for_sparse_attention(block_size, seq_len)
-        s = s.masked_fill(mask == 0, float('-inf'))
-        p = F.softmax(s, dim=3)
-        # attension , (b, head, seq, seq) , (b, head, seq, hidden) -> (b, head, seq, hidden)
-        o = torch.matmul(p, vt)
-        # (b, seq, head, hidden)
-        return o.permute(*[0, 2, 1, 3])
 
-    return attension
-
-def xformers_sparse_attension(dropout, block_size, seq_len = SEQ, num_heads = HEADS):
+def xformers_sparse_attension(dropout, block_size, seq_len = SEQ, num_heads = HEADS, sparse_type="fix"):
     # (b, head, seq, hidden) -> (b, head, seq, hidden)
-    return SparseAttention(dropout=dropout, block_size=block_size, seq_len = seq_len, num_heads = num_heads)
+    return SparseAttention(dropout=dropout, block_size=block_size, seq_len = seq_len, 
+    num_heads = num_heads, sparse_type=sparse_type)
 
 
 
-def test_basic(block_size):
+def test_basic(block_size, dtype, sparse_type):
     print(f"block size{block_size}")
-    attention = xformers_sparse_attension(1.0, block_size=block_size, seq_len = SEQ, num_heads = HEADS)
-    shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
-    dtype=torch.bfloat16
+    attention = xformers_sparse_attension(1.0, block_size=block_size, seq_len = SEQ, num_heads = HEADS, sparse_type=sparse_type)
+    shape = (BATCH, HEADS, SEQ, EMB // HEADS) 
     q = torch.randn(*shape, dtype=dtype).cuda()
     q.requires_grad_(True)
     k = torch.randn(*shape, dtype=dtype).cuda()
@@ -272,7 +256,7 @@ def test_basic(block_size):
         end_t = time.time()
         return (end_t - start_t) / iteration
 
-    print(f"block size {block_size} {func(10)}")
+    #print(f"sparse_type {sparse_type} block size {block_size} dtype {dtype} {func(10)}")
 
 
 def report_diff(context, a,  b):
@@ -288,7 +272,7 @@ def report_diff(context, a,  b):
 
 
 
-def test_stages_precision(block_size, dtype=torch.bfloat16):
+def test_stages_precision(block_size, dtype=torch.bfloat16, sparse_type="fix"):
     seed = 2
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -296,9 +280,7 @@ def test_stages_precision(block_size, dtype=torch.bfloat16):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    attention = HandWriteXformerSparse(block_size, HEADS, SEQ)
-    print(f"{attention.block_num*16*16}")
-
+    attention = HandWriteXformerSparse(block_size, HEADS, SEQ, sparse_type=sparse_type)
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
     q = torch.randn(*shape, dtype=dtype).cuda() 
     k = torch.randn(*shape, dtype=dtype).cuda() 
@@ -325,10 +307,10 @@ def test_stages_precision(block_size, dtype=torch.bfloat16):
     a.backward(out_grad)
     b.backward(out_grad)
     torch.cuda.synchronize()
-    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-attention", a, b)
-    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-q_grad", q.grad, q1.grad)
-    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-k_grad", k.grad, k1.grad)
-    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-v_grad", v.grad, v1.grad)
+    #report_diff(f"sparse_type {sparse_type} block_size[{block_size}]-dtype[{dtype}]-attention", a, b)
+    #report_diff(f"sparse_type {sparse_type} block_size[{block_size}]-dtype[{dtype}]-q_grad", q.grad, q1.grad)
+    #report_diff(f"sparse_type {sparse_type} block_size[{block_size}]-dtype[{dtype}]-k_grad", k.grad, k1.grad)
+    #report_diff(f"sparse_type {sparse_type} block_size[{block_size}]-dtype[{dtype}]-v_grad", v.grad, v1.grad)
 
 
     """
@@ -348,10 +330,23 @@ def test_stages_precision(block_size, dtype=torch.bfloat16):
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
     """
-    
+
+def print_sparsety(block_size, dtype=torch.bfloat16, sparse_type="fix"):
+    seq_len=32*1024 
+    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True)
+    non_zero_block_num = torch.sum(layout)
+    block = seq_len // block_size
+    total =  block * block
+    c_ratio = non_zero_block_num / total
+    a_ratio = c_ratio - ((block_size - 1)/(2*block_size))*(1/(block))
+    print(f"{sparse_type} block_size {block_size}  data load ={c_ratio}| effective {a_ratio}")
+
+
 if __name__ == "__main__":
-    
-    for block_size in [16, 32, 64, 128]:
-        for dtype in [torch.float32, torch.bfloat16]:
-            test_stages_precision(block_size, dtype)
-    
+    for dtype in [torch.float32, torch.bfloat16]:
+        for sparse_type in ["bird","fix"]:
+            for block_size in [16, 32, 64, 128]:
+                #test_basic(block_size, dtype, sparse_type)
+                print_sparsety(block_size, dtype, sparse_type)
+                #test_sparse_attention_performance(block_size, dtype, sparse_type)
+        

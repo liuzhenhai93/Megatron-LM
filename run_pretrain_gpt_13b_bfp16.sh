@@ -45,6 +45,8 @@ GPT_ARGS="--num-layers 10 \
           --train-iters 300 \
           --recompute-granularity full \
           --recompute-method uniform \
+          --sparse-attn-block-size 128 \
+          --sparse-attn-type bird \
           --use-sparse-attn \
           --bf16 
           "

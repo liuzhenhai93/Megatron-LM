@@ -758,7 +758,10 @@ def _add_training_args(parser):
     group.add_argument('--use-sparse-attn', action='store_true',
                        help='use SparseSelfAttention implementation of attention.')   
     group.add_argument('--sparse-attn-block-size', type=int, default=16,
-                       help='sparse attention block size')                                     
+                       help='sparse attention block size')    
+    group.add_argument('--sparse-attn-type', type=str, default="fix",
+                       help='sparse attention type, currently support fix and bird')                         
+
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
