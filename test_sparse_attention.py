@@ -15,7 +15,7 @@ import sys
 BATCH = 1
 TP = 8
 HEADS = 8 // TP
-SEQ = 1024
+SEQ = 1024*4
 EMB = 512*TP // TP
 DROPOUT = 0.1
 
@@ -177,14 +177,14 @@ class HandWriteXformerSparse():
 
     def stage1(self, q, k):
         self.try_create_kernel(q.device)
-        qt = q #/ math.sqrt(float(q.size(-1)))
+        qt = q / math.sqrt(float(q.size(-1)))
         s1 = self.sparse_dot_sdd(qt, k)
         s2 = self.dense_dot_sdd(qt, k)
         return s1, s2
 
-    def stod(self, so):
+    def stod(self, so, dtype=torch.float32):
         self.try_create_kernel(so.device)
-        do = self.sparse_dot_dsd(so, torch.diag(torch.ones([self.seq_len])).unsqueeze(0).unsqueeze(0).expand(BATCH, HEADS, -1, -1).to(torch.float32).cuda())
+        do = self.sparse_dot_dsd(so, torch.diag(torch.ones([self.seq_len])).unsqueeze(0).unsqueeze(0).expand(BATCH, HEADS, -1, -1).to(dtype).cuda())
         #do = do.masked_fill(self.mask == 0, 0.0)
         return do
 
@@ -288,7 +288,7 @@ def report_diff(context, a,  b):
 
 
 
-def test_stages_precision(block_size):
+def test_stages_precision(block_size, dtype=torch.bfloat16):
     seed = 2
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -300,102 +300,58 @@ def test_stages_precision(block_size):
     print(f"{attention.block_num*16*16}")
 
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
-    dtype=torch.float32
-    """
-    q = torch.rand(*shape, dtype=dtype).cuda() 
-    k = torch.rand(*shape, dtype=dtype).cuda() 
-    v = torch.rand(*shape, dtype=dtype).cuda() 
-    """
-    low = 0
-    high = 2
-    q = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*5
-    k = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()*5
-    #v = torch.randint(low=low, high=high, size=shape).to(dtype).cuda()
-    v=torch.diag(torch.ones([SEQ])).unsqueeze(0).unsqueeze(0).expand(BATCH, HEADS, -1, -1).to(torch.float32).cuda()
-    #print(v)
-    """
-    #v = torch.ones(size=shape).to(dtype).cuda()*4
-    #v = torch.randn(*shape, dtype=dtype).cuda()
-    q = torch.ones(size=shape).to(dtype).cuda()*5
-    k = torch.ones(size=shape).to(dtype).cuda()*5
-    v = torch.ones(size=shape).to(dtype).cuda()*5
-    """
+    q = torch.randn(*shape, dtype=dtype).cuda() 
+    k = torch.randn(*shape, dtype=dtype).cuda() 
+    v = torch.randn(*shape, dtype=dtype).cuda() 
+
+    q1 = q.detach()
+    k1 = k.detach()
+    v1 = v.detach()
+
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+
+    q1.requires_grad_(True)
+    k1.requires_grad_(True)
+    v1.requires_grad_(True)
+    
     torch.cuda.synchronize()
     
-    #k.requires_grad_(True)
-    #q.requires_grad_(True)
-    #v.requires_grad_(True)
-    """
+    out_grad = torch.ones(*shape).to(dtype).to("cuda:0")
+    
     a = attention.forward1(q, k, v)
-    b = attention.forward2(q, k, v)
+    b = attention.forward2(q1, k1, v1)
+    a.backward(out_grad)
+    b.backward(out_grad)
     torch.cuda.synchronize()
-    report_diff(f"block_size{block_size}-attention", a, b)
-    """
+    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-attention", a, b)
+    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-q_grad", q.grad, q1.grad)
+    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-k_grad", k.grad, k1.grad)
+    report_diff(f"block_size[{block_size}]-dtype[{dtype}]-v_grad", v.grad, v1.grad)
 
+
+    """
     stage1_1, stage1_2 = attention.stage1(q, k)
-    #print(stage1_1)
-    stage1_1d = attention.stodv2(stage1_1)
-    #stage1_1d2 = attention.stod(stage1_1)
-    stage1_1d3 = attention.stodv2(stage1_1, False)
-
-    #print(f"shape {stage1_1.shape}")
-    
-    #print(f"sparse numl {torch.numel(stage1_1)}")
-    for i in range(8):
-        for j in range(8):
-            pass
-            #print(f"block {i} {j}")
-            #print(stage1_1d[0, 0, i*16:(i+1)*16, j*16:(j+1)*16])
-
-
+    stage1_1d = attention.stod(stage1_1, dtype)
     torch.cuda.synchronize()
-    #report_diff(f"block_size{block_size}-qk", stage1_1d, stage1_2)
-    #report_diff(f"block_size{block_size}-stod-stodv2", stage1_1d, stage1_1d2)
-    #report_diff(f"block_size{block_size}-stod-stodv3", stage1_1d2, stage1_1d3)
+    report_diff(f"block_size{block_size}-qk", stage1_1d, stage1_2)
 
-    """
     stage2_1, stage2_2 = attention.stage2(stage1_1, stage1_1d)
     torch.cuda.synchronize()
     stage2_1d = attention.stodv2(stage2_1)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-soft", stage2_1d, stage2_2)
-    """
 
-    v[0][0][1:SEQ,1:SEQ] = 0
-    #print(v)
-    
-    stage1_1[0][0][1:,:]= 0
-    stage1_1[0][0][:,1:]= 0
-    stage1_1[0][0][1:,:]= 0
-    stage1_1[0][1:,:,:]= 0
-    #print(stage1_1)
-    stage1_1d[0][0][1:,:]= 0
-    stage1_1d[0][0][:,1:]= 0
     torch.cuda.synchronize()
     stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_1d, v)
     torch.cuda.synchronize()
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
-    trr = triton_dense_matmul(stage1_1d.reshape([SEQ, SEQ]), v.reshape([SEQ, SEQ]))
-    print(trr[0][0])
-
-    #print(stage3_1)
-    #print(stage3_2)
-    #print(attention.sparse_dot_dsd.c_lut)
-    print(attention.sparse_dot_dsd.c_width)
-
-    stage3_1, stage3_2 = attention.stage3(stage1_1, stage1_2, v)
-    torch.cuda.synchronize()
-    
-    #report_diff(f"block_size{block_size}-att_d2", stage3_1, stage3_2)
-
+    """
     
 if __name__ == "__main__":
     
     for block_size in [16, 32, 64, 128]:
-        #test_basic(block_size)    
-        #test_precision(block_size)
-        #test_stages_precision(block_size)
-        pass
-    test_stages_precision(32)    
-    #print(create_mask_for_sparse_attention(2, 16))
+        for dtype in [torch.float32, torch.bfloat16]:
+            test_stages_precision(block_size, dtype)
     
