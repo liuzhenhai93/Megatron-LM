@@ -4,7 +4,7 @@ import numpy as np
 import time
 from megatron.model.sparse_attention import XformerSparseAttention as SparseAttention
 from megatron.model.sparse_attention import create_layout
-from xformers.components.attention.sparsity_config import FixedSparsityConfig
+from megatron.model.transformer import FlashSelfAttention
 from triton.ops.blocksparse import matmul as blocksparse_matmul  # type: ignore
 from triton.ops.blocksparse import softmax as blocksparse_softmax  # type: ignore
 from triton.ops import matmul as dense_matmul
@@ -14,34 +14,61 @@ import sys
 
 import time
 from xformers.components.attention import BlockSparseAttention
-from xformers.components.attention.sparsity_config import FixedSparsityConfig
+
 
 
 BATCH = 1
 TP = 8
-HEADS = 8 // TP
-SEQ = 1024*32
-EMB = 8192 // TP
+HEADS = 3
+SEQ = 1024*8
+EMB = 128*HEADS
 DROPOUT = 0.1
 
 
-def create_mask_for_sparse_attention(block_size, seq_len = SEQ, sparse_type="fix"):
-    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True)
+def create_mask_for_sparse_attention(block_size, seq_len = SEQ, sparse_type="fix",**kwargs):
+    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True, **kwargs)
     mask =  torch.zeros((1, seq_len, seq_len), dtype=torch.uint8, device = torch.device('cuda:0'))
     for i in range (layout.shape[1]):
         for j in range (layout.shape[2]):
             mask[0][i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size] = layout[0][i][j]  
     return mask      
 
-def create_sparse_attention(sparse_type, block_size, seq_len, num_heads=1, dropout=0, causal=True):
+def create_sparse_attention(sparse_type, block_size, seq_len, num_heads=1, dropout=0, causal=True,**kwargs):
     layout = create_layout(sparse_type=sparse_type,num_heads=num_heads, seq_len=seq_len, 
-    block_size=block_size, causal=True)
+    block_size=block_size, causal=True, **kwargs)
     return BlockSparseAttention(layout=layout, block_size=block_size, 
     dropout=dropout, num_heads=num_heads, causal=causal)
+
+
+def test_flash_attention_performance(dtype = torch.bfloat16):
+    attention = FlashSelfAttention(causal=True)
+    shape = (BATCH, SEQ, HEADS, EMB // HEADS)  
+    q = torch.randn(*shape, dtype=dtype).cuda() 
+    k = torch.randn(*shape, dtype=dtype).cuda() 
+    v = torch.randn(*shape, dtype=dtype).cuda() 
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    out_grad = torch.ones(*shape).to(dtype).to("cuda:0")
+    t = attention(q, k, v)
+    t.backward(out_grad)
+    torch.cuda.synchronize()
+    begin = time.time()
+    t2 = attention(q, k, v)
+    #torch.cuda.synchronize()
+    end = time.time()
+    forward_time = end - begin
+    t2.backward(out_grad)
+    torch.cuda.synchronize()
+    backward_time = time.time() - begin
+    print(f"flash-attention,x,1.0,1.0,{forward_time},{backward_time},{forward_time+backward_time}")
+    
+
+
                                 
 
-def test_sparse_attention_performance(block_size, dtype, sparse_type="fix"):
-    attention = create_sparse_attention(sparse_type,block_size=block_size, seq_len=SEQ)
+def test_sparse_attention_performance(block_size, dtype, sparse_type="fix",**kwargs):
+    attention = create_sparse_attention(sparse_type, block_size=block_size, seq_len=SEQ, num_heads=HEADS, dropout=0,causal=True,**kwargs)
     shape = (BATCH, HEADS, SEQ, EMB // HEADS)  
     q = torch.randn(*shape, dtype=dtype).cuda() 
     k = torch.randn(*shape, dtype=dtype).cuda() 
@@ -59,11 +86,17 @@ def test_sparse_attention_performance(block_size, dtype, sparse_type="fix"):
     end = time.time()
     forward_time = end - begin
     t2.backward(out_grad)
-    backward_time = time.time() - end
     torch.cuda.synchronize()
-    print(f"{sparse_type} block_size {block_size} dtype {dtype} : forward {forward_time} backward {backward_time}")
-    
+    backward_time = time.time() - end
 
+    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=SEQ, block_size=block_size, causal=True, **kwargs)
+    non_zero_block_num = torch.sum(layout)
+    block = SEQ // block_size
+    total =  block * block
+    c_ratio = non_zero_block_num / total
+    a_ratio = c_ratio - ((block_size - 1)/(2*block_size))*(1/(block))
+    print(f'{sparse_type},"{kwargs}",{2*c_ratio},{2*a_ratio},{forward_time},{backward_time},{forward_time+backward_time}')
+    
 
 
 class HandWriteXformerSparse():
@@ -331,22 +364,49 @@ def test_stages_precision(block_size, dtype=torch.bfloat16, sparse_type="fix"):
     report_diff(f"block_size{block_size}-att", stage3_1, stage3_2)
     """
 
-def print_sparsety(block_size, dtype=torch.bfloat16, sparse_type="fix"):
-    seq_len=32*1024 
-    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True)
+def print_sparsety(seq_len, block_size, dtype=torch.bfloat16, sparse_type="fix", **kwargs):
+    layout = create_layout(sparse_type=sparse_type,num_heads=1, seq_len=seq_len, block_size=block_size, causal=True, **kwargs)
     non_zero_block_num = torch.sum(layout)
     block = seq_len // block_size
     total =  block * block
     c_ratio = non_zero_block_num / total
     a_ratio = c_ratio - ((block_size - 1)/(2*block_size))*(1/(block))
-    print(f"{sparse_type} block_size {block_size}  data load ={c_ratio}| effective {a_ratio}")
+    print(f"{sparse_type} {kwargs} block_size {block_size}  block ={non_zero_block_num}| total {total} comp load {c_ratio}| algri load {a_ratio}")
+
+
+def test_performance():
+    # base line flash attension
+    print("attr-type,config,comp-load,algri-load,forward,backwrd,total")
+    test_flash_attention_performance()
+    #print("| --- | ---- | ---- | ---- | ---- | ---- | ---- |")
+    block_size = 64
+    sparse_type = "fix"
+    for dtype in [torch.bfloat16]:
+        for (num_local_blocks, num_global_blocks) in [(4, 1),(8, 1),(8, 2),(8, 4),(16, 2),(16,4),(16, 8), (32, 2), (32, 4), (32, 8),(32, 16), (64, 4), (64, 8),(64, 16), (64, 32)]:
+            test_sparse_attention_performance(block_size, dtype, sparse_type, num_local_blocks=num_local_blocks, num_global_blocks=num_global_blocks)   
+
+    sparse_type = "bird"
+    """
+    for dtype in [torch.bfloat16]:
+        for i in range(8):
+            j = 2**i
+            num_sliding_window_blocks = 2*j + 1 
+            num_global_blocks = j
+            num_random_blocks = j
+            test_sparse_attention_performance(block_size, dtype, sparse_type, num_sliding_window_blocks=num_sliding_window_blocks, num_global_blocks=num_global_blocks, num_random_blocks=num_random_blocks)   
+    """
+   
+    for dtype in [torch.bfloat16]:
+        for i in range(8):
+            j = 2**i
+            num_sliding_window_blocks = 2*j + 1 
+            num_random_blocks = 2*j + 1
+            num_global_blocks = 2*j
+            test_sparse_attention_performance(block_size, dtype, sparse_type, num_sliding_window_blocks=num_sliding_window_blocks, num_global_blocks=num_global_blocks, num_random_blocks=num_random_blocks)   
 
 
 if __name__ == "__main__":
-    for dtype in [torch.float32, torch.bfloat16]:
-        for sparse_type in ["bird","fix"]:
-            for block_size in [16, 32, 64, 128]:
-                #test_basic(block_size, dtype, sparse_type)
-                print_sparsety(block_size, dtype, sparse_type)
-                #test_sparse_attention_performance(block_size, dtype, sparse_type)
+    test_performance()  
+    print_sparsety(seq_len=4096, block_size=64, sparse_type="bird", num_sliding_window_blocks=3, num_global_blocks=2, num_random_blocks=3)
+
         

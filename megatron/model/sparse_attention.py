@@ -9,19 +9,19 @@ from megatron import get_args, core
 from megatron.core import mpu
 
 
-def create_layout(sparse_type, num_heads, seq_len, block_size, causal=True):
+def create_layout(sparse_type, num_heads, seq_len, block_size, causal=True, **kwargs):
     assert sparse_type.upper() in ["BIRD", "FIX"], "type must be BIRD, or FIX"
 
     def fix_layout():
-        config = FixedSparsityConfig(num_heads, attention="unidirectional",block_size=block_size)
+        config = FixedSparsityConfig(num_heads, attention="unidirectional",block_size=block_size, **kwargs)
         layout = config.make_layout(seq_len)
         return layout
 
     def bird_layout():
-        config = BigBirdSparsityConfig(num_heads, attention="bidirectional",block_size=block_size)
+        config = BigBirdSparsityConfig(num_heads, attention="bidirectional",block_size=block_size, **kwargs)
         layout = config.make_layout(seq_len)
         return layout
-        
+    #print(f"seq_len {seq_len} num_heads {num_heads}")    
     layout = fix_layout() if sparse_type.upper() == "FIX" else bird_layout()
     layout = torch.tril(layout) if causal else layout
     layout = layout.to(torch.int32).cuda()  
@@ -48,7 +48,7 @@ class XformerSparseAttention(MegatronModule):
         if not sparse_type:
             sparse_type = args.sparse_attn_type
 
-        layout = create_layout(sparse_type, num_heads, seq_len, block_size, causal)    
+        layout = create_layout(sparse_type, num_heads, seq_len, block_size, causal, num_sliding_window_blocks=17, num_global_blocks=16, num_random_blocks=17)    
         self._att = BlockSparseAttention(layout=layout, 
         block_size=block_size, 
         dropout=dropout, 
