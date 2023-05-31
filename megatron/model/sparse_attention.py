@@ -27,7 +27,6 @@ def create_layout(sparse_type, num_heads, seq_len, block_size, causal=True, **kw
     layout = layout.to(torch.int32).cuda()  
     return  layout
 
-
 class XformerSparseAttention(MegatronModule):
 
     def __init__(self, dropout=0.5, causal=True, sparse_type=None, block_size=None, seq_len=None, num_heads=None):
@@ -48,7 +47,7 @@ class XformerSparseAttention(MegatronModule):
         if not sparse_type:
             sparse_type = args.sparse_attn_type
 
-        layout = create_layout(sparse_type, num_heads, seq_len, block_size, causal, num_sliding_window_blocks=17, num_global_blocks=16, num_random_blocks=17)    
+        layout = create_layout(sparse_type, num_heads, seq_len, block_size, causal)    
         self._att = BlockSparseAttention(layout=layout, 
         block_size=block_size, 
         dropout=dropout, 
