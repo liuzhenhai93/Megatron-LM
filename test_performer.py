@@ -164,18 +164,12 @@ def softmax_kernel_transformation(data,
   diag_data = torch.sum(diag_data, dim=data.dim() - 1)
   diag_data = diag_data / 2.0
   diag_data = torch.unsqueeze(diag_data, dim=data.dim() - 1)
-  last_dims_t = (len(data_dash.shape) - 1,)
-  attention_dims_t = (len(data_dash.shape) - 3,)
-  if is_query:
-    data_dash = ratio * (
-        torch.exp(data_dash - diag_data - torch.max(
-            data_dash, dim=last_dims_t, keepdim=True)) + numerical_stabilizer)
-  else:
-    data_dash = ratio * (
-        torch.exp(data_dash - diag_data - torch.max(
-            data_dash, dim=last_dims_t + attention_dims_t, keepdim=True)) +
-        numerical_stabilizer)
-
+  last_dims_t = len(data_dash.shape) - 1
+  attention_dims_t = len(data_dash.shape) - 3
+  max_value = torch.max(data_dash, dim=last_dims_t, keepdim=True)[0]
+  if not is_query:
+    max_value = torch.max(max_value, dim=attention_dims_t, keepdim=True)[0]
+  data_dash = ratio * (torch.exp(data_dash - diag_data - max_value) + numerical_stabilizer)
   return data_dash
 
 
@@ -190,8 +184,8 @@ def noncausal_numerator(qs, ks, vs):
   Returns:
     Not-normalized FAVOR noncausal attention AV.
   """
-  kvs = tf.einsum("lbhm,lbhd->bhmd", ks, vs)
-  return tf.einsum("lbhm,bhmd->lbhd", qs, kvs)
+  kvs = torch.einsum("lbhm,lbhd->bhmd", ks, vs)
+  return torch.einsum("lbhm,bhmd->lbhd", qs, kvs)
 
 
 def noncausal_denominator(qs, ks):
@@ -210,7 +204,7 @@ def noncausal_denominator(qs, ks):
 
 
 #@tf.custom_gradient
-def causal_numerator(qs, ks, vs):
+def causal_nominator(qs, ks, vs):
   """Computes not-normalized FAVOR causal attention A_{masked}V.
 
   Args:
@@ -223,40 +217,13 @@ def causal_numerator(qs, ks, vs):
   """
 
   result = []
-  sums = tf.zeros_like(tf.einsum("ijk,ijl->ijkl", ks[0], vs[0]))
+  sums = torch.zeros_like(torch.einsum("ijk,ijl->ijkl", ks[0], vs[0]))
 
   for index in range(qs.shape[0]):
-    sums = sums + tf.einsum("ijk,ijl->ijkl", ks[index], vs[index])
-    result.append(tf.einsum("ijkl,ijk->ijl", sums, qs[index])[None, Ellipsis])
-
-  result = tf.concat(result, axis=0)
-
-  def grad(res_grad):
-
-    grads = tf.zeros_like(tf.einsum("ijk,ijl->ijkl", ks[0], vs[0]))
-
-    gr_sums = sums
-
-    q_grads = []
-    k_grads = []
-    v_grads = []
-
-    for index in range(qs.shape[0] - 1, -1, -1):
-
-      q_grads.append(
-          tf.einsum("ijkl,ijl->ijk", gr_sums, res_grad[index])[None, Ellipsis])
-      grads = grads + tf.einsum("ijk,ijl->ijkl", qs[index], res_grad[index])
-      k_grads.append(tf.einsum("ijkl,ijl->ijk", grads, vs[index])[None, Ellipsis])
-      v_grads.append(tf.einsum("ijkl,ijk->ijl", grads, ks[index])[None, Ellipsis])
-      gr_sums = gr_sums - tf.einsum("ijk,ijl->ijkl", ks[index], vs[index])
-
-    q_grads = tf.concat(q_grads[::-1], axis=0)
-    k_grads = tf.concat(k_grads[::-1], axis=0)
-    v_grads = tf.concat(v_grads[::-1], axis=0)
-
-    return q_grads, k_grads, v_grads
-
-  return result, grad
+    sums = sums + torch.einsum("ijk,ijl->ijkl", ks[index], vs[index])
+    result.append(torch.einsum("ijkl,ijk->ijl", sums, qs[index])[None, Ellipsis])
+  result = torch.concat(result, dim=0)
+  return result
 
 
 #@tf.custom_gradient
@@ -279,30 +246,7 @@ def causal_denominator(qs, ks):
     result.append(tf.reduce_sum(qs[index] * sums, axis=2)[None, Ellipsis])
 
   result = tf.concat(result, axis=0)
-
-  def grad(res_grad):
-
-    k_grad = tf.zeros_like(ks[0])
-
-    gr_sums = sums
-
-    q_grads = []
-    k_grads = []
-
-    for index in range(qs.shape[0] - 1, -1, -1):
-
-      q_grads.append(
-          tf.einsum("ijk,ij->ijk", gr_sums, res_grad[index])[None, Ellipsis])
-      k_grad = k_grad + tf.einsum("ijk,ij->ijk", qs[index], res_grad[index])
-      k_grads.append(k_grad[None, Ellipsis])
-      gr_sums = gr_sums - ks[index]
-
-    q_grads = tf.concat(q_grads[::-1], axis=0)
-    k_grads = tf.concat(k_grads[::-1], axis=0)
-
-    return q_grads, k_grads
-
-  return result, grad
+  return result
 
 
 def favor_attention(query,
@@ -327,9 +271,9 @@ def favor_attention(query,
   query_prime = kernel_transformation(query, True,
                                       projection_matrix)  # [B,L,H,M]
   key_prime = kernel_transformation(key, False, projection_matrix)  # [B,L,H,M]
-  query_prime = tf.transpose(query_prime, [1, 0, 2, 3])  # [L,B,H,M]
-  key_prime = tf.transpose(key_prime, [1, 0, 2, 3])  # [L,B,H,M]
-  value = tf.transpose(value, [1, 0, 2, 3])  # [L,B,H,D]
+  query_prime = torch.permute(query_prime, [1, 0, 2, 3])  # [L,B,H,M]
+  key_prime = torch.permute(key_prime, [1, 0, 2, 3])  # [L,B,H,M]
+  value = torch.permute(value, [1, 0, 2, 3])  # [L,B,H,D]
 
   if causal:
     av_attention = causal_numerator(query_prime, key_prime, value)
@@ -337,183 +281,11 @@ def favor_attention(query,
   else:
     av_attention = noncausal_numerator(query_prime, key_prime, value)
     attention_normalizer = noncausal_denominator(query_prime, key_prime)
-  # TODO(kchoro): Add more comments.
-  av_attention = tf.transpose(av_attention, [1, 0, 2, 3])
+  av_attention = tf.transpose(av_attention, [1, 0, 2, 3]) # [B, L, H , D]
   attention_normalizer = tf.transpose(attention_normalizer, [1, 0, 2])
   attention_normalizer = tf.expand_dims(attention_normalizer,
                                         len(attention_normalizer.shape))
   return av_attention / attention_normalizer
-
-
-class Attention:
-  """Multi-headed attention layer."""
-
-  def __init__(self,
-               hidden_size,
-               num_heads,
-               attention_dropout,
-               kernel_transformation=relu_kernel_transformation,
-               numerical_stabilizer=0.001,
-               causal=False,
-               projection_matrix_type=None,
-               nb_random_features=0):
-    """Initialize Attention.
-
-    Args:
-      hidden_size: int, output dim of hidden layer.
-      num_heads: int, number of heads to repeat the same attention structure.
-      attention_dropout: float, dropout rate inside attention for training.
-      kernel_transformation: transformation used to produce kernel features for
-        attention.
-      numerical_stabilizer: used to bound away from zero kernel values.
-      causal: whether attention is causal or not.
-      projection_matrix_type: None if Identity should be used, otherwise random
-        projection matrix will be applied.
-      nb_random_features: number of random features to be used (relevant only if
-        projection_matrix is not None).
-    """
-    if hidden_size % num_heads:
-      raise ValueError(
-          "Hidden size ({}) must be divisible by the number of heads ({})."
-          .format(hidden_size, num_heads))
-
-    super(Attention, self).__init__()
-    self.hidden_size = hidden_size
-    self.num_heads = num_heads
-    self.attention_dropout = attention_dropout
-    self.kernel_transformation = kernel_transformation
-    self.numerical_stabilizer = numerical_stabilizer
-    self.causal = causal
-    self.projection_matrix_type = projection_matrix_type
-    self.nb_random_features = nb_random_features
-
-  def build(self, input_shape):
-    """Builds the layer."""
-    # Layers for linearly projecting the queries, keys, and values.
-    size_per_head = self.hidden_size // self.num_heads
-
-    def _glorot_initializer(fan_in, fan_out):
-      limit = math.sqrt(6.0 / (fan_in + fan_out))
-      return tf.keras.initializers.RandomUniform(minval=-limit, maxval=limit)
-
-    attention_initializer = _glorot_initializer(input_shape.as_list()[-1],
-                                                self.hidden_size)
-    self.query_dense_layer = util.DenseEinsum(
-        output_shape=(self.num_heads, size_per_head),
-        kernel_initializer=attention_initializer,
-        use_bias=False,
-        name="query")
-    self.key_dense_layer = util.DenseEinsum(
-        output_shape=(self.num_heads, size_per_head),
-        kernel_initializer=attention_initializer,
-        use_bias=False,
-        name="key")
-    self.value_dense_layer = util.DenseEinsum(
-        output_shape=(self.num_heads, size_per_head),
-        kernel_initializer=attention_initializer,
-        use_bias=False,
-        name="value")
-
-    output_initializer = _glorot_initializer(self.hidden_size, self.hidden_size)
-    self.output_dense_layer = util.DenseEinsum(
-        output_shape=self.hidden_size,
-        num_summed_dimensions=2,
-        kernel_initializer=output_initializer,
-        use_bias=False,
-        name="output_transform")
-    super(Attention, self).build(input_shape)
-
-  def get_config(self):
-    return {
-        "hidden_size": self.hidden_size,
-        "num_heads": self.num_heads,
-        "attention_dropout": self.attention_dropout,
-    }
-
-  def call(self,
-           query_input,
-           source_input,
-           bias,
-           training,
-           cache=None,
-           decode_loop_step=None):
-    """Apply attention mechanism to query_input and source_input.
-
-    Args:
-      query_input: A tensor with shape [batch_size, length_query, hidden_size].
-      source_input: A tensor with shape [batch_size, length_source,
-        hidden_size].
-      bias: A tensor with shape [batch_size, 1, length_query, length_source],
-        the attention bias that will be added to the result of the dot product.
-      training: A bool, whether in training mode or not.
-      cache: (Used during prediction) A dictionary with tensors containing
-        results of previous attentions. The dictionary must have the items:
-            {"k": tensor with shape [batch_size, i, heads, dim_per_head],
-             "v": tensor with shape [batch_size, i, heads, dim_per_head]} where
-               i is the current decoded length for non-padded decode, or max
-               sequence length for padded decode.
-      decode_loop_step: An integer, step number of the decoding loop. Used only
-        for autoregressive inference on TPU.
-
-    Returns:
-      Attention layer output with shape [batch_size, length_query, hidden_size]
-    """
-    # Linearly project the query, key and value using different learned
-    # projections. Splitting heads is automatically done during the linear
-    # projections --> [batch_size, length, num_heads, dim_per_head].
-    query = self.query_dense_layer(query_input)
-    key = self.key_dense_layer(source_input)
-    value = self.value_dense_layer(source_input)
-
-    if self.projection_matrix_type is None:
-      projection_matrix = None
-    else:
-      dim = query.shape[-1]
-      seed = tf.math.ceil(tf.math.abs(tf.math.reduce_sum(query) * BIG_CONSTANT))
-      seed = tf.dtypes.cast(seed, tf.int32)
-      projection_matrix = create_projection_matrix(
-          self.nb_random_features, dim, seed=seed)
-
-    if cache is not None:
-      # Combine cached keys and values with new keys and values.
-      if decode_loop_step is not None:
-        cache_k_shape = cache["k"].shape.as_list()
-        indices = tf.reshape(
-            tf.one_hot(decode_loop_step, cache_k_shape[1], dtype=key.dtype),
-            [1, cache_k_shape[1], 1, 1])
-        key = cache["k"] + key * indices
-        cache_v_shape = cache["v"].shape.as_list()
-        indices = tf.reshape(
-            tf.one_hot(decode_loop_step, cache_v_shape[1], dtype=value.dtype),
-            [1, cache_v_shape[1], 1, 1])
-        value = cache["v"] + value * indices
-      else:
-        key = tf.concat([tf.cast(cache["k"], key.dtype), key], axis=1)
-        value = tf.concat([tf.cast(cache["v"], value.dtype), value], axis=1)
-
-      # Update cache
-      cache["k"] = key
-      cache["v"] = value
-
-    attention_output = favor_attention(query, key, value,
-                                       self.kernel_transformation, self.causal,
-                                       projection_matrix)
-    attention_output = self.output_dense_layer(attention_output)
-    return attention_output
-
-
-class SelfAttention(Attention):
-  """Multiheaded self-attention layer."""
-
-  def call(self,
-           query_input,
-           bias,
-           training,
-           cache=None,
-           decode_loop_step=None):
-    return super(SelfAttention, self).call(query_input, query_input, bias,
-                                           training, cache, decode_loop_step)
-
 
 
 if __name__ == "__main__":
@@ -522,7 +294,7 @@ if __name__ == "__main__":
   dtype = torch.float
   device = torch.device("cuda")
   project = create_projection_matrix(m, d, dtype, device)
-  print(torch.matmul(project, torch.transpose(project,0,1)))
+  #print(torch.matmul(project, torch.transpose(project,0,1)))
    
   # b l h d 
   shape = (1, 256, 8, 128)  
@@ -530,7 +302,16 @@ if __name__ == "__main__":
   k = torch.randn(*shape, dtype=dtype).cuda() 
   v = torch.randn(*shape, dtype=dtype).cuda() 
 
-  q_transformed = softmax_kernel_transformation(q, True, project)
-  print(q.shape)
+  #q_transformed = softmax_kernel_transformation(q, True, project)
+  #print(q.shape)
+  #nominator = causal_nominator(q, k, v)[0]
+  #print(nominator)
+
+  #[batch_size, length, num_heads, dim_per_head]
+  attention = favor_attention(q, k, v, softmax_kernel_transformation, True, project)
+  print(attention)
+
+
+
 
 
