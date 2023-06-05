@@ -7,11 +7,13 @@ Prefix Sum Tensorflow implementation by Valerii Likhosherstov.
 import math
 import numpy as np
 import torch
+import torch.nn.functional as F
+import time
 
 BIG_CONSTANT = 1e8
 
 
-def create_projection_matrix(m, d, dtype, device, seed=0, scaling=1, struct_mode=False):
+def create_projection_matrix(m, d, dtype, device, seed=0, scaling=0, struct_mode=True):
   r"""Constructs the matrix of random projections.
 
   Constructs a matrix of random orthogonal projections. Each projection vector
@@ -39,21 +41,23 @@ def create_projection_matrix(m, d, dtype, device, seed=0, scaling=1, struct_mode
   current_seed = seed
   for _ in range(nb_full_blocks):
     if struct_mode:
-      q = create_products_of_givens_rotations(d, seed)
+      q = create_products_of_givens_rotations(d, current_seed).to(device).to(dtype)
     else:
-      unstructured_block = torch.randn((d, d), device=device)
+      torch.random.manual_seed(current_seed)
+      torch.cuda.manual_seed(current_seed)
+      unstructured_block = torch.randn((d, d), dtype=torch.float64, device=device)
       # col vector is orthogonal
       q, _ = torch.linalg.qr(unstructured_block)
-      q = torch.transpose(q, 0, 1)
+      q = torch.transpose(q.to(dtype), 0, 1)
     block_list.append(q)
     current_seed += 1
   remaining_rows = m - nb_full_blocks * d
   if remaining_rows > 0:
     if struct_mode:
-      torch.random.manual_seed(seed)
-      q = create_products_of_givens_rotations(d, seed)
+      q = create_products_of_givens_rotations(d, current_seed).to(device).to(dtype)
     else:
       torch.random.manual_seed(current_seed)
+      torch.cuda.manual_seed(current_seed)
       unstructured_block = torch.randn((d, d), device=device)
       # col vector is orthogonal
       q, _ = torch.linalg.qr(unstructured_block)
@@ -63,7 +67,7 @@ def create_projection_matrix(m, d, dtype, device, seed=0, scaling=1, struct_mode
   current_seed += 1
 
   if scaling == 0:
-    multiplier = torch.norm(torch.randn((d, d), device=device), dim=1)
+    multiplier = torch.norm(torch.randn((m, d), device=device), dim=1)
   elif scaling == 1:
     multiplier = np.sqrt(float(d)) * torch.ones((m)).to(device)
   else:
@@ -125,7 +129,6 @@ def relu_kernel_transformation(data,
   Returns:
     Corresponding kernel feature map.
   """
-  del is_query
   if projection_matrix is None:
     return tf.nn.relu(data) + numerical_stabilizer
   else:
@@ -156,9 +159,11 @@ def softmax_kernel_transformation(data,
   Returns:
     Corresponding kernel feature map.
   """
-  data_normalizer = 1.0 / data.shape[-1]
+  data_normalizer = 1.0 
+  if not is_query:
+    data_normalizer = 1.0 / np.sqrt(np.sqrt(float(data.shape[-1])))
   data = data_normalizer * data
-  ratio = 1.0 / projection_matrix.shape[0]
+  ratio = 1.0 / np.sqrt(float(projection_matrix.shape[0]))
   data_dash = torch.einsum("blhd,md->blhm", data, projection_matrix)
   diag_data = torch.square(data)
   diag_data = torch.sum(diag_data, dim=data.dim() - 1)
@@ -204,7 +209,7 @@ def noncausal_denominator(qs, ks):
 
 
 #@tf.custom_gradient
-def causal_nominator(qs, ks, vs):
+def causal_numerator(qs, ks, vs):
   """Computes not-normalized FAVOR causal attention A_{masked}V.
 
   Args:
@@ -239,13 +244,13 @@ def causal_denominator(qs, ks):
   """
 
   result = []
-  sums = tf.zeros_like(ks[0])
+  sums = torch.zeros_like(ks[0])
 
   for index in range(qs.shape[0]):
     sums = sums + ks[index]
-    result.append(tf.reduce_sum(qs[index] * sums, axis=2)[None, Ellipsis])
+    result.append(torch.sum(qs[index] * sums, dim=2)[None, Ellipsis])
 
-  result = tf.concat(result, axis=0)
+  result = torch.concat(result, dim=0)
   return result
 
 
@@ -254,7 +259,7 @@ def favor_attention(query,
                     value,
                     kernel_transformation,
                     causal,
-                    projection_matrix=None):
+                    projection_matrix=softmax_kernel_transformation):
   """Computes FAVOR normalized attention.
 
   Args:
@@ -281,35 +286,105 @@ def favor_attention(query,
   else:
     av_attention = noncausal_numerator(query_prime, key_prime, value)
     attention_normalizer = noncausal_denominator(query_prime, key_prime)
-  av_attention = tf.transpose(av_attention, [1, 0, 2, 3]) # [B, L, H , D]
-  attention_normalizer = tf.transpose(attention_normalizer, [1, 0, 2])
-  attention_normalizer = tf.expand_dims(attention_normalizer,
-                                        len(attention_normalizer.shape))
+  av_attention = torch.permute(av_attention, [1, 0, 2, 3]) # [B, L, H , D]
+  attention_normalizer = torch.permute(attention_normalizer, [1, 0, 2])
+  attention_normalizer = torch.unsqueeze(attention_normalizer, dim=len(attention_normalizer.shape))
   return av_attention / attention_normalizer
+
+
+def naive_attention(q, k, v, causal):
+  # (b, seq, head, hidden) -> (b, head, seq, hidden)
+  qt = q.permute(*[0, 2, 1, 3])
+  kt = k.permute(*[0, 2, 1, 3])
+  vt = v.permute(*[0, 2, 1, 3])
+  # scale
+  scale = 1.0 / np.sqrt(q.shape[-1])
+  # q * k^t, (b, head, seq, hidden), (b, head, hidden, seq)-> (b, head, seq, seq)
+  s = torch.matmul(qt, kt.permute(*[0, 1, 3, 2]))
+  s = s * scale
+  # mask or not
+  if causal:
+      seq_len = s.shape[-1]
+      mask = torch.triu(torch.ones((1, seq_len, seq_len),dtype=torch.uint8, device = torch.device('cuda:0')), diagonal=1)
+      s = s.masked_fill(mask == 1, float('-inf'))
+  p = F.softmax(s, dim=3)
+  # attension , (b, head, seq, seq) , (b, head, seq, hidden) -> (b, head, seq, hidden)
+  o = torch.matmul(p, vt)
+  # (b, seq, head, hidden)
+  return o.permute(*[0, 2, 1, 3])
+
+
+def report_diff(context, a,  b):
+  out1 = a.to(torch.float32).detach().cpu().numpy().flatten()  
+  out2 = b.to(torch.float32).detach().cpu().numpy().flatten()
+  diff = np.abs(out1 - out2)
+  args_max = np.argmax(diff)
+  ind = np.unravel_index(args_max, diff.shape)
+  mean = np.mean(diff)
+  var = np.var(diff)
+  print(f"{context}: max_diff={diff[ind]}, out1[{ind}]={out1[ind]} out2[{ind}]={out2[ind]}, diff mean={mean} var={var}")  
+
+
+def time_func(func, iteration=10):
+    time_interval = 0.0
+    for i in range(iteration):
+        func()
+        torch.cuda.synchronize()
+        begin = time.time()
+        func()
+        end = time.time()
+        torch.cuda.synchronize()
+        time_interval += (end - begin)
+    return time_interval / iteration
 
 
 if __name__ == "__main__":
   m = 128
-  d = 128
+  d = 16
   dtype = torch.float
   device = torch.device("cuda")
   project = create_projection_matrix(m, d, dtype, device)
-  #print(torch.matmul(project, torch.transpose(project,0,1)))
+  print(torch.matmul(project, torch.transpose(project,0,1)))
    
   # b l h d 
-  shape = (1, 256, 8, 128)  
-  q = torch.randn(*shape, dtype=dtype).cuda() 
-  k = torch.randn(*shape, dtype=dtype).cuda() 
-  v = torch.randn(*shape, dtype=dtype).cuda() 
+  shape = (1, 4096, 8, 16)  
+  seed = 2
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed(seed)
+  q = torch.rand(*shape, dtype=dtype).cuda() 
+  k = torch.rand(*shape, dtype=dtype).cuda() 
+  v = torch.rand(*shape, dtype=dtype).cuda() 
 
   #q_transformed = softmax_kernel_transformation(q, True, project)
   #print(q.shape)
   #nominator = causal_nominator(q, k, v)[0]
   #print(nominator)
-
   #[batch_size, length, num_heads, dim_per_head]
-  attention = favor_attention(q, k, v, softmax_kernel_transformation, True, project)
-  print(attention)
+
+  _ = favor_attention(q, k, v, softmax_kernel_transformation, True, project)
+  torch.cuda.synchronize()
+  time_begin = time.time()
+  favor_result = favor_attention(q, k, v, softmax_kernel_transformation, True, project)
+  torch.cuda.synchronize()
+
+  #print(attention)
+
+  naive_result = naive_attention(q, k, v, True)
+
+  report_diff("favor vs naive", favor_result, naive_result)
+  #print(favor_result)
+  def func1():
+    return favor_attention(q, k, v, softmax_kernel_transformation, True, project)
+
+  def func2():
+    return naive_attention(q, k, v, True)
+
+  print(time_func(func1))
+  print(time_func(func2))
+
+
+
+  
 
 
 
