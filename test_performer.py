@@ -344,16 +344,16 @@ if __name__ == "__main__":
   dtype = torch.float
   device = torch.device("cuda")
   project = create_projection_matrix(m, d, dtype, device)
-  print(torch.matmul(project, torch.transpose(project,0,1)))
+  #print(torch.matmul(project, torch.transpose(project,0,1)))
    
   # b l h d 
   shape = (1, 4096, 8, 16)  
   seed = 2
   torch.manual_seed(seed)
   torch.cuda.manual_seed(seed)
-  q = torch.rand(*shape, dtype=dtype).cuda() 
-  k = torch.rand(*shape, dtype=dtype).cuda() 
-  v = torch.rand(*shape, dtype=dtype).cuda() 
+  q = torch.randn(*shape, dtype=dtype).cuda() 
+  k = torch.randn(*shape, dtype=dtype).cuda() 
+  v = torch.randn(*shape, dtype=dtype).cuda() 
 
   #q_transformed = softmax_kernel_transformation(q, True, project)
   #print(q.shape)
@@ -365,6 +365,7 @@ if __name__ == "__main__":
   torch.cuda.synchronize()
   time_begin = time.time()
   favor_result = favor_attention(q, k, v, softmax_kernel_transformation, True, project)
+  print(favor_result.shape)
   torch.cuda.synchronize()
 
   #print(attention)
