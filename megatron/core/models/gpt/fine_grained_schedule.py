@@ -247,8 +247,19 @@ class DenseAttnNode(TransformerLayerNode):
         attention_bias = self.chunk_state.attention_bias
         inference_params = self.chunk_state.inference_params
         packed_seq_params = self.chunk_state.packed_seq_params
+        sequence_len_offset = self.chunk_state.sequence_len_offset
 
-        hidden_states = self.layer._submodule_attention_forward()
+        hidden_states = self.layer._submodule_attention_forward(
+            hidden_states,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
         return hidden_states
 
 
