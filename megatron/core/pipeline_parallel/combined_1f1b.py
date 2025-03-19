@@ -9,7 +9,6 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-#from megatron.legacy.model import Float16Module
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, make_viewless_tensor
@@ -502,7 +501,9 @@ def wrap_forward_func(config, forward_step_func):
     """wrap the input to forward_step_func, to make forward_step_func return schedule plan"""
 
     def wrapped_func(data_iterator, model):
-        return forward_step_func(data_iterator, unwrap_model(model).build_schedule_plan)
+        from megatron.legacy.model import Float16Module as LegacyFloat16Module
+        return forward_step_func(data_iterator,
+                                 unwrap_model(model,(LegacyFloat16Module, Float16Module, DistributedDataParallel)).build_schedule_plan)
 
     if config.combined_1f1b and config.combined_1f1b_recipe == "ep_a2a":
         return wrapped_func
